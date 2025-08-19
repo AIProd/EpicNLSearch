@@ -3,7 +3,7 @@ import os
 import re
 import json
 from dataclasses import dataclass, asdict
-from typing import Optional, List, Dict, Tuple
+from typing import Optional, List, Dict
 
 import numpy as np
 import pandas as pd
@@ -109,10 +109,10 @@ def safe_json_loads(s: str) -> dict:
         m = re.search(r'\{.*\}', s, flags=re.S)
         return json.loads(m.group(0)) if m else {}
 
-# ===================== LLM PROMPTS =====================
-EXTRACT_SYSTEM = """You are a clinical information extraction service.
-Return a SINGLE JSON object only — no extra text — with the exact schema given."""
+# ===================== LLM PROMPTS (brace-safe) =====================
+EXTRACT_SYSTEM = "You are a clinical information extraction service. Return a SINGLE JSON object only — no extra text — with the exact schema given."
 
+# All literal braces are doubled {{ ... }} so .format() doesn't treat them as placeholders.
 EXTRACT_USER_TMPL = """Extract structured fields from the clinical {kind} report text below.
 Use this JSON schema exactly; unknowns must be null.
 
@@ -145,22 +145,23 @@ TEXT:
 >>>
 """
 
-PARSE_SYSTEM = """You convert natural-language cohort questions into compact filter JSON. Return a SINGLE JSON object, no extra text."""
+PARSE_SYSTEM = "You convert natural-language cohort questions into compact filter JSON. Return a SINGLE JSON object, no extra text."
 
+# Also brace-escaped.
 PARSE_USER_TMPL = """Turn this question into filters.
 
 QUESTION:
 {q}
 
 Return JSON with this schema:
-{
-  "filters": {
+{{
+  "filters": {{
     "cancer_type": "bladder" | null,
-    "tnm_include": [ "PT3", "PT4" ],   // normalized TNM T-specs to include (T3/T4/pT3/pT4 -> "PT3"/"PT4")
+    "tnm_include": ["PT3","PT4"],   // normalized TNM T-specs to include (T3/T4/pT3/pT4 -> "PT3"/"PT4")
     "recurrence_required": true | false,
-    "size_cm": { "op": ">=" | "<" | "<=" | ">" | "==", "value": number } | null
-  }
-}
+    "size_cm": {{ "op": ">=" | "<" | "<=" | ">" | "==", "value": number }} | null
+  }}
+}}
 Rules:
 - If the question asks "WITH recurrence/progression", set recurrence_required=true. If it merely says "include recurrence" as a column, set false.
 - Normalize T3/T4 or pT3/pT4 to "PT3"/"PT4" in tnm_include.
@@ -235,17 +236,25 @@ if ingest_btn:
 
                 pid = derive_pid_from_name(up.name)
                 kind = guess_kind_from_name(up.name)  # 'pathology' or 'radiology'
-                j = llm_extract_struct(client, model, text, pid=pid, kind=kind)
+                try:
+                    j = llm_extract_struct(client, model, text, pid=pid, kind=kind)
+                except Exception as e:
+                    st.error(f"LLM extraction failed for {up.name}: {e}")
+                    continue
 
                 pf = st.session_state.facts_map.get(pid, PatientFacts(patient_id=pid, treatments=[], sources=[]))
 
                 # Merge LLM output into PatientFacts
                 pf.cancer_type   = j.get("cancer_type") or pf.cancer_type
                 pf.tnm_stage     = j.get("tnm_stage") or pf.tnm_stage
-                val = j.get("tumor_size_cm"); 
-                if isinstance(val, (int, float)): 
-                    if pf.tumor_size_cm is None or float(val) > float(pf.tumor_size_cm):
-                        pf.tumor_size_cm = float(val)
+                val = j.get("tumor_size_cm")
+                if isinstance(val, (int, float, str)) and str(val).strip():
+                    try:
+                        valf = float(val)
+                        if pf.tumor_size_cm is None or valf > float(pf.tumor_size_cm):
+                            pf.tumor_size_cm = valf
+                    except Exception:
+                        pass
                 if j.get("diagnosis_date"): pf.diagnosis_date = j["diagnosis_date"]
                 if j.get("surgery_date"):   pf.surgery_date   = j["surgery_date"]
 
@@ -256,9 +265,10 @@ if ingest_btn:
                         "date": rec.get("date"),
                         "site": rec.get("site"),
                     }
-                    # last_ct_date best-effort from recurrence date if present
                     if not pf.last_ct_date and rec.get("date"):
                         pf.last_ct_date = rec["date"]
+                elif isinstance(rec, dict) and rec.get("has_recurrence") is False:
+                    pf.recurrence = None  # ensure cleared if previously set
 
                 if pf.sources is None: pf.sources = []
                 pf.sources.append({"type": f"{kind}_report", "origin": "upload", "name": up.name})
@@ -291,14 +301,18 @@ if demo_btn:
     ]
     with st.spinner("Extracting demo with LLM..."):
         for name, kind, pid, text in demo_docs:
-            j = llm_extract_struct(get_openai_client(), model, text, pid=pid, kind=kind)
+            j = llm_extract_struct(client, model, text, pid=pid, kind=kind)
             pf = st.session_state.facts_map.get(pid, PatientFacts(patient_id=pid, treatments=[], sources=[]))
             pf.cancer_type   = j.get("cancer_type") or pf.cancer_type
             pf.tnm_stage     = j.get("tnm_stage") or pf.tnm_stage
-            val = j.get("tumor_size_cm"); 
-            if isinstance(val, (int, float)): 
-                if pf.tumor_size_cm is None or float(val) > float(pf.tumor_size_cm):
-                    pf.tumor_size_cm = float(val)
+            val = j.get("tumor_size_cm")
+            if isinstance(val, (int, float, str)) and str(val).strip():
+                try:
+                    valf = float(val)
+                    if pf.tumor_size_cm is None or valf > float(pf.tumor_size_cm):
+                        pf.tumor_size_cm = valf
+                except Exception:
+                    pass
             if j.get("diagnosis_date"): pf.diagnosis_date = j["diagnosis_date"]
             if j.get("surgery_date"):   pf.surgery_date   = j["surgery_date"]
             rec = j.get("recurrence") or {}
@@ -306,6 +320,8 @@ if demo_btn:
                 pf.recurrence = {"has_recurrence": True, "date": rec.get("date"), "site": rec.get("site")}
                 if not pf.last_ct_date and rec.get("date"):
                     pf.last_ct_date = rec["date"]
+            elif isinstance(rec, dict) and rec.get("has_recurrence") is False:
+                pf.recurrence = None
             if pf.sources is None: pf.sources = []
             pf.sources.append({"type": f"{kind}_report", "origin": "demo", "name": name})
             st.session_state.facts_map[pid] = pf
@@ -328,7 +344,7 @@ def apply_filters(df: pd.DataFrame, fjson: dict) -> pd.DataFrame:
         mask = pd.Series(False, index=out.index)
         for t in tnm_list:
             rx = r'\b' + re.escape(t) + r'\b'
-            mask = mask | out["tnm_stage"].astype(str).str.upper().str.contains(rx, regex=True, na=False)
+            mask = mask | out["tnm_stage"].astype(str).str.upper().str.replace(" ", "", regex=False).str.contains(rx, regex=True, na=False)
         out = out[mask]
 
     # recurrence
@@ -376,14 +392,17 @@ if run_btn:
         client = get_openai_client()
         if client is None:
             st.stop()
-        with st.spinner("Parsing question with LLM..."):
-            parsed = llm_parse_query(client, model, question)
-        st.caption(f"Parsed filters: `{json.dumps(parsed, ensure_ascii=False)}`")
-        res = apply_filters(st.session_state.facts, parsed)
-        st.success(f"{len(res)} rows")
-        st.dataframe(res, use_container_width=True, height=420)
-        st.download_button("Download results CSV", data=res.to_csv(index=False).encode("utf-8"),
-                           file_name="cohort.csv", mime="text/csv")
+        try:
+            with st.spinner("Parsing question with LLM..."):
+                parsed = llm_parse_query(client, model, question)
+            st.caption(f"Parsed filters: `{json.dumps(parsed, ensure_ascii=False)}`")
+            res = apply_filters(st.session_state.facts, parsed)
+            st.success(f"{len(res)} rows")
+            st.dataframe(res, use_container_width=True, height=420)
+            st.download_button("Download results CSV", data=res.to_csv(index=False).encode("utf-8"),
+                               file_name="cohort.csv", mime="text/csv")
+        except Exception as e:
+            st.error(f"LLM query parsing failed: {e}")
 
 if export_all_btn:
     if st.session_state.facts.empty:
