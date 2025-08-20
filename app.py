@@ -18,7 +18,7 @@ st.title("🩺 EPIC NL Search — LLM-first PoC (aligned to CT / PET-CT / Cytolo
 st.markdown("""
 Upload **de-identified, text-based PDFs**. This LLM-first app will:
 - Extract patient ID (MRN or name+DOB), dates, TNM/tumor size (if present),
-- Detect **metastasis sites** (liver/lung/nodes/bone/other), **nodal disease**, and **recurrence/progression** only when appropriate,
+- Detect **metastasis sites** (liver/lung/nodes/bone/other), **nodal disease**, and **recurrence/progression** when appropriate,
 - Merge multiple reports for the same patient,
 - Parse your natural-language question and return a cohort table you can download.
 
@@ -68,12 +68,16 @@ class PatientFacts:
     surgery_date: Optional[str] = None
 
     # Disease status
-    recurrence: Optional[Dict] = None       # {"has_recurrence": bool, "date": str|None, "site": str|None, "reason": "progression/new lesion/..."}
+    recurrence: Optional[Dict] = None       # {"has_recurrence": bool, "date": str|None, "site": str|None, "reason": str|None}
     last_ct_date: Optional[str] = None
     death_date: Optional[str] = None
     nodal_disease: Optional[bool] = None    # any mention of nodal disease
-    metastasis: Optional[Dict] = None       # {"has_metastasis": bool, "sites": [..]}  (lung/liver/bone/brain/other)
-    sources: List[Dict] = None              # list of {"type": "...", "origin": "upload/demo", "name": filename}
+    metastasis: Optional[Dict] = None       # {"has_metastasis": bool, "sites": [...]}
+
+    # 👇 Added to match instantiation elsewhere
+    treatments: Optional[List[Dict]] = None
+
+    sources: List[Dict] = None              # [{"type": "...", "origin": "upload/demo", "name": filename}]
 
 def ensure_state():
     if "facts_map" not in st.session_state:
@@ -110,7 +114,7 @@ def derive_pid_from_extracted(j: dict, fallback_filename: str) -> str:
     mrn = (j.get("mrn") or "").strip()
     if mrn and re.fullmatch(r"[A-Za-z0-9\-]{6,}", mrn):
         return mrn
-    # Else fallback to normalized "LAST,FIRST (DOB)" if present
+    # Else fallback to normalized "LAST,FIRST [DOB]" if present
     name = (j.get("patient_name") or "").strip()
     dob  = (j.get("dob") or "").strip()
     if name and dob:
@@ -261,6 +265,12 @@ if clear_btn:
     st.success("Cleared in-memory data.")
 
 # ===================== INGEST (LLM-EXTRACT) =====================
+def safe_append(lst: Optional[List], item):
+    if lst is None:
+        return [item]
+    lst.append(item)
+    return lst
+
 if ingest_btn:
     client = get_openai_client()
     if client is None:
@@ -337,24 +347,62 @@ if ingest_btn:
                     if not pf.last_ct_date and j.get("exam_date"):
                         pf.last_ct_date = j.get("exam_date")
                 elif isinstance(rec, dict) and rec.get("has_recurrence") is False:
-                    # preserve a positive already-set recurrence; otherwise set/keep negative
                     if pf.recurrence is None:
                         pf.recurrence = {"has_recurrence": False, "date": None, "site": None, "reason": None}
 
-                if pf.sources is None: pf.sources = []
-                # Save doc type by inspecting report text lightly
-                doc_type = ("PET/CT" if "pet" in kind else
-                            "CT/CTA" if "ct" in kind else
-                            "Cytology" if "cyto" in kind else
-                            "Pathology" if "path" in kind else
-                            "Note")
-                pf.sources.append({"type": doc_type, "origin": "upload", "name": up.name})
+                # sources
+                dtype = ("PET/CT" if "pet" in kind else
+                         "CT/CTA" if "ct" in kind else
+                         "Cytology" if "cyto" in kind else
+                         "Pathology" if "path" in kind else
+                         "Note")
+                pf.sources = safe_append(pf.sources, {"type": dtype, "origin": "upload", "name": up.name})
 
                 st.session_state.facts_map[pid] = pf
                 added += 1
 
         facts_map_to_df()
         st.success(f"Processed {added} PDFs. Patients in memory: {len(st.session_state.facts)}")
+
+# ===================== LLM PROMPTS =====================
+PARSE_SYSTEM = "You convert cohort questions into compact JSON filters. Return ONE JSON object, no prose."
+
+PARSE_USER_TMPL = """Convert this question into filters.
+
+QUESTION:
+{q}
+
+Return JSON with this exact shape:
+{{
+  "filters": {{
+    "cancer_type_contains": null,     // e.g., "bladder", "renal", "urothelial" (case-insensitive substring) or null
+    "tnm_include": [],                // e.g., ["PT3","PT4"] (normalize T-specs T3/T4/pT3/pT4 -> PT3/PT4)
+    "recurrence_required": false,     // true if "WITH recurrence/progression" is requested
+    "metastasis_required": false,     // true if they ask for metastasis/metastatic disease
+    "met_sites_any": [],              // e.g., ["Liver","Lung","Lymph nodes","Bone","Brain","Adrenal","Other"]
+    "size_cm": null                   // {{ "op": ">="|"<"|"<="|">"|"==", "value": number }}
+  }}
+}}
+Interpretation rules:
+- If the question mentions "bladder", "urothelial", "renal", "kidney", set cancer_type_contains accordingly (one best term).
+- If it says "WITH recurrence" or "progression", set recurrence_required=true.
+- If it says "metastatic" or specific sites (liver/lung/nodes/bone/brain/adrenal), set metastasis_required=true and include those sites in met_sites_any.
+- If a cm threshold is mentioned ("size >= 3 cm", or just "3 cm"), fill size_cm (default op \">=\" if only a number is given).
+- Normalize TNM T-specs to uppercase "PT3","PT4" etc.
+"""
+
+def llm_parse_query(client: OpenAI, model: str, q: str) -> dict:
+    messages = [
+        {"role": "system", "content": PARSE_SYSTEM},
+        {"role": "user", "content": PARSE_USER_TMPL.format(q=q)}
+    ]
+    resp = client.chat.completions.create(
+        model=model,
+        messages=messages,
+        temperature=0,
+        response_format={"type": "json_object"}
+    )
+    return safe_json_loads(resp.choices[0].message.content)
 
 # ===================== LLM QUERY PARSING + FILTERING =====================
 def apply_filters(df: pd.DataFrame, fjson: dict) -> pd.DataFrame:
@@ -380,7 +428,7 @@ def apply_filters(df: pd.DataFrame, fjson: dict) -> pd.DataFrame:
     if f.get("recurrence_required") and "recurrence" in out.columns:
         out = out[out["recurrence"].apply(lambda x: bool(isinstance(x, dict) and x.get("has_recurrence")))]
 
-    # metastasis
+    # metastasis overall
     if f.get("metastasis_required") and "metastasis" in out.columns:
         out = out[out["metastasis"].apply(lambda x: bool(isinstance(x, dict) and x.get("has_metastasis")))]
 
