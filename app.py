@@ -13,23 +13,23 @@ from openai import OpenAI
 
 # ===================== CONFIG =====================
 st.set_page_config(page_title="EPIC NL Search — LLM PoC", page_icon="🩺", layout="wide")
-st.title("🩺 EPIC NL Search — LLM-first PoC")
+st.title("🩺 EPIC NL Search — LLM-first PoC (aligned to CT / PET-CT / Cytology PDFs)")
 
 st.markdown("""
-This PoC uses a **Large Language Model** to:
-1) **Extract** structured fields from uploaded clinical PDFs (pathology/radiology): TNM stage, tumor size (cm), key dates, recurrence/progression (+ negation), cancer type.
-2) **Parse your natural question** into filters and return a cohort table you can download as CSV.
+Upload **de-identified, text-based PDFs**. This LLM-first app will:
+- Extract patient ID (MRN or name+DOB), dates, TNM/tumor size (if present),
+- Detect **metastasis sites** (liver/lung/nodes/bone/other), **nodal disease**, and **recurrence/progression** only when appropriate,
+- Merge multiple reports for the same patient,
+- Parse your natural-language question and return a cohort table you can download.
 
-**Notes**
-- Use **de-identified, text-based PDFs** for now (no OCR).
-- Set your **OPENAI_API_KEY** as an environment variable in your deployment (Streamlit Cloud → Secrets, or locally via shell).
+**Note**: “Initial staging” PET/CT with metastatic disease is recorded as **metastasis**, not **recurrence**.
 """)
 
 # ===================== OPENAI CLIENT =====================
 def get_openai_client() -> Optional[OpenAI]:
     key = os.getenv("OPENAI_API_KEY", "").strip()
     if not key:
-        st.error("OPENAI_API_KEY is not set. Please configure it in your environment/secrets to use the LLM.")
+        st.error("OPENAI_API_KEY is not set. Configure it in your environment or Streamlit Secrets.")
         return None
     try:
         client = OpenAI()
@@ -38,29 +38,42 @@ def get_openai_client() -> Optional[OpenAI]:
         st.error(f"Failed to initialize OpenAI client: {e}")
         return None
 
-# Choose model (fast+cheap by default)
+# Sidebar settings
 with st.sidebar:
     st.header("⚙️ Settings")
-    model = st.selectbox("OpenAI model", ["gpt-4o-mini", "gpt-4o"], index=0, help="Use 4o-mini for speed/cost; 4o for maximum quality.")
-    max_chars = st.slider("Max characters per document sent to LLM", min_value=2000, max_value=16000, step=1000, value=7000)
+    model = st.selectbox(
+        "OpenAI model",
+        ["gpt-4o-mini", "gpt-4o"],
+        index=0,
+        help="Use 4o-mini for speed/cost; 4o for max quality."
+    )
+    max_chars = st.slider("Max characters per document sent to LLM",
+                          min_value=2000, max_value=20000, step=1000, value=9000)
     st.caption("Large PDFs are truncated to this length to control cost.")
 
 # ===================== DATA MODEL =====================
 @dataclass
 class PatientFacts:
-    patient_id: str
+    patient_id: str                         # canonical key (MRN preferred)
+    mrn: Optional[str] = None
+    name: Optional[str] = None
+    dob: Optional[str] = None
+
     age: Optional[int] = None
     bmi: Optional[float] = None
-    cancer_type: Optional[str] = None
+    cancer_type: Optional[str] = None       # e.g., "Bladder cancer", "Renal cell carcinoma"
     tnm_stage: Optional[str] = None
     tumor_size_cm: Optional[float] = None
     diagnosis_date: Optional[str] = None
     surgery_date: Optional[str] = None
-    treatments: List[Dict] = None
-    recurrence: Optional[Dict] = None  # {"has_recurrence": bool, "date": str|None, "site": str|None}
+
+    # Disease status
+    recurrence: Optional[Dict] = None       # {"has_recurrence": bool, "date": str|None, "site": str|None, "reason": "progression/new lesion/..."}
     last_ct_date: Optional[str] = None
     death_date: Optional[str] = None
-    sources: List[Dict] = None
+    nodal_disease: Optional[bool] = None    # any mention of nodal disease
+    metastasis: Optional[Dict] = None       # {"has_metastasis": bool, "sites": [..]}  (lung/liver/bone/brain/other)
+    sources: List[Dict] = None              # list of {"type": "...", "origin": "upload/demo", "name": filename}
 
 def ensure_state():
     if "facts_map" not in st.session_state:
@@ -82,24 +95,44 @@ def pdf_to_text(file_bytes: bytes) -> str:
 
 def guess_kind_from_name(name: str) -> str:
     n = name.lower()
-    if any(k in n for k in ["ct", "mr", "mri", "pet", "scan", "radiology", "imaging", "chest", "abd", "pelvis"]):
-        return "radiology"
+    if any(k in n for k in ["pet", "pet/ct", "nm", "nuc", "nuclear"]):
+        return "radiology_petct"
+    if any(k in n for k in ["ct", "cta", "mr", "mri", "scan", "radiology", "imaging", "abd", "pelvis", "chest"]):
+        return "radiology_ct"
+    if any(k in n for k in ["cyto", "cytology"]):
+        return "cytology"
     if any(k in n for k in ["path", "surg", "biopsy", "histology", "specimen", "gross", "microscopic", "turbt"]):
         return "pathology"
-    return "pathology"
+    return "note"
 
-def derive_pid_from_name(name: str) -> str:
-    # leading token of filename (without extension) is treated as patient ID
-    stem = name.rsplit(".", 1)[0]
+def derive_pid_from_extracted(j: dict, fallback_filename: str) -> str:
+    # Prefer MRN if it looks like an ID
+    mrn = (j.get("mrn") or "").strip()
+    if mrn and re.fullmatch(r"[A-Za-z0-9\-]{6,}", mrn):
+        return mrn
+    # Else fallback to normalized "LAST,FIRST (DOB)" if present
+    name = (j.get("patient_name") or "").strip()
+    dob  = (j.get("dob") or "").strip()
+    if name and dob:
+        return f"{name} [{dob}]"
+    if name:
+        return name
+    # Else use the leading token from filename
+    stem = fallback_filename.rsplit(".", 1)[0]
     tok = re.split(r'[\s\-_]+', stem)
     return tok[0] if tok else stem
 
 def facts_map_to_df():
     df = pd.DataFrame([asdict(v) for v in st.session_state.facts_map.values()])
+
+    # Expand status fields for easy filtering
     if "recurrence" in df.columns:
         df["recurrence_flag"] = df["recurrence"].apply(lambda x: bool(isinstance(x, dict) and x.get("has_recurrence")))
         df["recurrence_date"] = df["recurrence"].apply(lambda x: x.get("date") if isinstance(x, dict) else None)
         df["recurrence_site"] = df["recurrence"].apply(lambda x: x.get("site") if isinstance(x, dict) else None)
+    if "metastasis" in df.columns:
+        df["metastasis_flag"] = df["metastasis"].apply(lambda x: bool(isinstance(x, dict) and x.get("has_metastasis")))
+        df["metastasis_sites"] = df["metastasis"].apply(lambda x: ", ".join(x.get("sites", [])) if isinstance(x, dict) else None)
     st.session_state.facts = df
 
 def safe_json_loads(s: str) -> dict:
@@ -110,34 +143,44 @@ def safe_json_loads(s: str) -> dict:
         return json.loads(m.group(0)) if m else {}
 
 # ===================== LLM PROMPTS (brace-safe) =====================
-EXTRACT_SYSTEM = "You are a clinical information extraction service. Return a SINGLE JSON object only — no extra text — with the exact schema given."
+EXTRACT_SYSTEM = (
+    "You are a clinical information extraction service. "
+    "Return ONE JSON object only — no extra text — matching the schema."
+)
 
-# All literal braces are doubled {{ ... }} so .format() doesn't treat them as placeholders.
-EXTRACT_USER_TMPL = """Extract structured fields from the clinical {kind} report text below.
-Use this JSON schema exactly; unknowns must be null.
+# Doubled braces to keep .format() happy
+EXTRACT_USER_TMPL = """From this clinical {kind} report text, extract the following fields into JSON.
+Unknown fields must be null or sensible defaults.
 
 {{
-  "patient_id": "{pid}",
-  "cancer_type": null,
-  "tnm_stage": null,
-  "tumor_size_cm": null,
+  "patient_name": null,              // e.g., "Watson, Johanna K"
+  "mrn": null,                       // medical record number if present (e.g., '88848822')
+  "dob": null,                       // patient date of birth as written
+  "exam_date": null,                 // the exam/report date, normalized if you can (YYYY-MM-DD) else as written
+  "cancer_type": null,               // e.g., "Renal cell carcinoma", "Bladder cancer", etc., if a convincing primary is implied
+  "tnm_stage": null,                 // e.g., "pT3a N0 M0" if present (pathology); PET/CT may omit
+  "tumor_size_cm": null,             // numeric cm if a dominant primary lesion is measured
   "diagnosis_date": null,
   "surgery_date": null,
-  "recurrence": {{
+
+  "nodal_disease": null,             // true/false if nodes involved or metastatic; null if not stated
+  "metastasis": {{                   // for PET/CT or CT when mets are described
+    "has_metastasis": false,
+    "sites": []                      // from: ["Liver","Lung","Lymph nodes","Bone","Brain","Adrenal","Other"]
+  }},
+  "recurrence": {{                   // ONLY true if text implies recurrence/progression/new/worsening compared with prior
     "has_recurrence": false,
-    "date": null,
-    "site": null
+    "date": null,                    // if a comparison date or study date implies recurrence timing
+    "site": null,                    // best single site if stated
+    "reason": null                   // e.g., "progression", "new lesions", "interval increase"; DO NOT set true for initial staging
   }}
 }}
 
-Guidelines:
-- cancer_type: "Bladder cancer" if text indicates bladder/urothelial primary; else null.
-- tnm_stage: normalized like "pT3a N0 M0" (or "T3 N1 Mx" if pathologic marker absent).
-- tumor_size_cm: numeric in **cm** if present.
-- diagnosis_date/surgery_date: ISO-like dates if present (YYYY-MM-DD if you can infer, else as written).
-- recurrence: True only if there is **positive evidence** of RECURRENCE/PROGRESSION/METASTASIS; set site if described
-  (e.g., "Lymph nodes", "Bladder/Pelvis (GU)", "Distant (lung/chest)", "Distant (other)"). If the text says **no** evidence of
-  recurrence/metastasis/progression/lymphadenopathy, keep has_recurrence = false.
+Rules:
+- Prefer MRN and patient name exactly as printed if you can find them.
+- PET/CT reports often list **initial staging** and **metastatic** disease; in such cases set metastasis.has_metastasis=true with appropriate sites, but keep recurrence.has_recurrence=false unless the text says progression, recurrence, or new/worsening compared to prior.
+- In CT impressions, phrases like "lymphadenopathy", "metastatic", "new lesions", "interval increase/worsening" suggest nodal disease, metastasis, or recurrence (only mark recurrence if compared to prior or explicitly stated).
+- Cytology/pathology reports that say "Negative for malignant cells" should NOT set cancer_type nor recurrence/metastasis true.
 
 TEXT:
 <<<
@@ -145,36 +188,38 @@ TEXT:
 >>>
 """
 
-PARSE_SYSTEM = "You convert natural-language cohort questions into compact filter JSON. Return a SINGLE JSON object, no extra text."
+PARSE_SYSTEM = "You convert cohort questions into compact JSON filters. Return ONE JSON object, no prose."
 
-# Also brace-escaped.
-PARSE_USER_TMPL = """Turn this question into filters.
+PARSE_USER_TMPL = """Convert this question into filters.
 
 QUESTION:
 {q}
 
-Return JSON with this schema:
+Return JSON with this exact shape:
 {{
   "filters": {{
-    "cancer_type": "bladder" | null,
-    "tnm_include": ["PT3","PT4"],   // normalized TNM T-specs to include (T3/T4/pT3/pT4 -> "PT3"/"PT4")
-    "recurrence_required": true | false,
-    "size_cm": {{ "op": ">=" | "<" | "<=" | ">" | "==", "value": number }} | null
+    "cancer_type_contains": null,     // e.g., "bladder", "renal", "urothelial" (case-insensitive substring) or null
+    "tnm_include": [],                // e.g., ["PT3","PT4"] (normalize T-specs T3/T4/pT3/pT4 -> PT3/PT4)
+    "recurrence_required": false,     // true if "WITH recurrence/progression" is requested
+    "metastasis_required": false,     // true if they ask for metastasis/metastatic disease
+    "met_sites_any": [],              // e.g., ["Liver","Lung","Lymph nodes","Bone","Brain","Adrenal","Other"]
+    "size_cm": null                   // {{ "op": ">="|"<"|"<="|">"|"==", "value": number }}
   }}
 }}
-Rules:
-- If the question asks "WITH recurrence/progression", set recurrence_required=true. If it merely says "include recurrence" as a column, set false.
-- Normalize T3/T4 or pT3/pT4 to "PT3"/"PT4" in tnm_include.
-- If a cm threshold is given (like ">= 3 cm" or "size > 3 cm" or "3 cm"), set size_cm accordingly (default operator is ">=" if only a number is given).
-- If the question says bladder cancer (e.g., "bladder"), set cancer_type="bladder".
+Interpretation rules:
+- If the question mentions "bladder", "urothelial", "renal", "kidney", set cancer_type_contains accordingly (one best term).
+- If it says "WITH recurrence" or "progression", set recurrence_required=true.
+- If it says "metastatic" or specific sites (liver/lung/nodes/bone/brain/adrenal), set metastasis_required=true and include those sites in met_sites_any.
+- If a cm threshold is mentioned ("size >= 3 cm", or just "3 cm"), fill size_cm (default op \">=\" if only a number is given).
+- Normalize TNM T-specs to uppercase "PT3","PT4" etc.
 """
 
 # ===================== LLM CALLS =====================
-def llm_extract_struct(client: OpenAI, model: str, body: str, pid: str, kind: str) -> dict:
-    body = (body or "")[:max_chars]  # truncate long docs for cost control
+def llm_extract_struct(client: OpenAI, model: str, body: str, kind: str) -> dict:
+    body = (body or "")[:max_chars]  # truncate long docs
     messages = [
         {"role": "system", "content": EXTRACT_SYSTEM},
-        {"role": "user", "content": EXTRACT_USER_TMPL.format(kind=kind, pid=pid, body=body)}
+        {"role": "user", "content": EXTRACT_USER_TMPL.format(kind=kind, body=body)}
     ]
     resp = client.chat.completions.create(
         model=model,
@@ -199,11 +244,10 @@ def llm_parse_query(client: OpenAI, model: str, q: str) -> dict:
 
 # ===================== SIDEBAR: UPLOADS =====================
 with st.sidebar:
-    st.subheader("📥 Upload de-identified PDFs")
+    st.subheader("📥 Upload PDFs")
     uploads = st.file_uploader(
-        "Filenames should include a patient ID",
-        type=["pdf"],
-        accept_multiple_files=True
+        "Filenames can be anything — the app will read MRN/Name from inside the PDF.",
+        type=["pdf"], accept_multiple_files=True
     )
     col1, col2 = st.columns(2)
     with col1:
@@ -214,7 +258,7 @@ with st.sidebar:
 if clear_btn:
     st.session_state.facts_map.clear()
     st.session_state.facts = pd.DataFrame()
-    st.success("Cleared all in-memory data.")
+    st.success("Cleared in-memory data.")
 
 # ===================== INGEST (LLM-EXTRACT) =====================
 if ingest_btn:
@@ -234,19 +278,26 @@ if ingest_btn:
                     st.warning(f"Skipped (no extractable text): {up.name}")
                     continue
 
-                pid = derive_pid_from_name(up.name)
-                kind = guess_kind_from_name(up.name)  # 'pathology' or 'radiology'
+                kind = guess_kind_from_name(up.name)  # initial guess, not critical
                 try:
-                    j = llm_extract_struct(client, model, text, pid=pid, kind=kind)
+                    j = llm_extract_struct(client, model, text, kind=kind)
                 except Exception as e:
                     st.error(f"LLM extraction failed for {up.name}: {e}")
                     continue
 
+                # Build/merge PatientFacts
+                pid = derive_pid_from_extracted(j, up.name)
                 pf = st.session_state.facts_map.get(pid, PatientFacts(patient_id=pid, treatments=[], sources=[]))
 
-                # Merge LLM output into PatientFacts
-                pf.cancer_type   = j.get("cancer_type") or pf.cancer_type
-                pf.tnm_stage     = j.get("tnm_stage") or pf.tnm_stage
+                # identity
+                pf.mrn = j.get("mrn") or pf.mrn
+                pf.name = j.get("patient_name") or pf.name
+                pf.dob  = j.get("dob") or pf.dob
+
+                # core fields
+                pf.cancer_type = j.get("cancer_type") or pf.cancer_type
+                pf.tnm_stage   = j.get("tnm_stage") or pf.tnm_stage
+
                 val = j.get("tumor_size_cm")
                 if isinstance(val, (int, float, str)) and str(val).strip():
                     try:
@@ -255,8 +306,25 @@ if ingest_btn:
                             pf.tumor_size_cm = valf
                     except Exception:
                         pass
+
                 if j.get("diagnosis_date"): pf.diagnosis_date = j["diagnosis_date"]
                 if j.get("surgery_date"):   pf.surgery_date   = j["surgery_date"]
+
+                # nodal / mets / recurrence
+                nd = j.get("nodal_disease")
+                if isinstance(nd, bool):
+                    pf.nodal_disease = nd if pf.nodal_disease is None else (pf.nodal_disease or nd)
+
+                mets = j.get("metastasis") or {}
+                if isinstance(mets, dict) and mets.get("has_metastasis"):
+                    prev_sites = set((pf.metastasis or {}).get("sites", []))
+                    new_sites  = set(mets.get("sites", []))
+                    pf.metastasis = {
+                        "has_metastasis": True,
+                        "sites": sorted(prev_sites.union(new_sites))
+                    }
+                elif pf.metastasis is None:
+                    pf.metastasis = {"has_metastasis": False, "sites": []}
 
                 rec = j.get("recurrence") or {}
                 if isinstance(rec, dict) and rec.get("has_recurrence") is True:
@@ -264,14 +332,23 @@ if ingest_btn:
                         "has_recurrence": True,
                         "date": rec.get("date"),
                         "site": rec.get("site"),
+                        "reason": rec.get("reason")
                     }
-                    if not pf.last_ct_date and rec.get("date"):
-                        pf.last_ct_date = rec["date"]
+                    if not pf.last_ct_date and j.get("exam_date"):
+                        pf.last_ct_date = j.get("exam_date")
                 elif isinstance(rec, dict) and rec.get("has_recurrence") is False:
-                    pf.recurrence = None  # ensure cleared if previously set
+                    # preserve a positive already-set recurrence; otherwise set/keep negative
+                    if pf.recurrence is None:
+                        pf.recurrence = {"has_recurrence": False, "date": None, "site": None, "reason": None}
 
                 if pf.sources is None: pf.sources = []
-                pf.sources.append({"type": f"{kind}_report", "origin": "upload", "name": up.name})
+                # Save doc type by inspecting report text lightly
+                doc_type = ("PET/CT" if "pet" in kind else
+                            "CT/CTA" if "ct" in kind else
+                            "Cytology" if "cyto" in kind else
+                            "Pathology" if "path" in kind else
+                            "Note")
+                pf.sources.append({"type": doc_type, "origin": "upload", "name": up.name})
 
                 st.session_state.facts_map[pid] = pf
                 added += 1
@@ -279,71 +356,23 @@ if ingest_btn:
         facts_map_to_df()
         st.success(f"Processed {added} PDFs. Patients in memory: {len(st.session_state.facts)}")
 
-# ===================== OPTIONAL DEMO BUTTON (LLM) =====================
-with st.sidebar:
-    st.subheader("⚡ Demo (no files)")
-    demo_btn = st.button("Add demo patients (BLD123, BLD999) via LLM")
-
-if demo_btn:
-    client = get_openai_client()
-    if client is None:
-        st.stop()
-
-    demo_docs = [
-        ("BLD123_pathology.txt", "pathology", "BLD123",
-         "Final Diagnosis: Invasive urothelial carcinoma (bladder). Pathologic stage: pT3a N0 M0. Tumor size 5.2 cm. Date: 2024-06-14."),
-        ("BLD123_ct.txt", "radiology", "BLD123",
-         "CT CHEST 2024-10-21. New lesion and mediastinal lymphadenopathy. Impression: progression consistent with recurrence."),
-        ("BLD999_pathology.txt", "pathology", "BLD999",
-         "Urothelial carcinoma of the bladder. Pathologic stage: pT4 N1 M0. Tumor size 3.2 cm. Date: 2024-05-03."),
-        ("BLD999_ct.txt", "radiology", "BLD999",
-         "CT 2025-01-05. No lymphadenopathy. No evidence of recurrence or metastasis.")
-    ]
-    with st.spinner("Extracting demo with LLM..."):
-        for name, kind, pid, text in demo_docs:
-            j = llm_extract_struct(client, model, text, pid=pid, kind=kind)
-            pf = st.session_state.facts_map.get(pid, PatientFacts(patient_id=pid, treatments=[], sources=[]))
-            pf.cancer_type   = j.get("cancer_type") or pf.cancer_type
-            pf.tnm_stage     = j.get("tnm_stage") or pf.tnm_stage
-            val = j.get("tumor_size_cm")
-            if isinstance(val, (int, float, str)) and str(val).strip():
-                try:
-                    valf = float(val)
-                    if pf.tumor_size_cm is None or valf > float(pf.tumor_size_cm):
-                        pf.tumor_size_cm = valf
-                except Exception:
-                    pass
-            if j.get("diagnosis_date"): pf.diagnosis_date = j["diagnosis_date"]
-            if j.get("surgery_date"):   pf.surgery_date   = j["surgery_date"]
-            rec = j.get("recurrence") or {}
-            if isinstance(rec, dict) and rec.get("has_recurrence") is True:
-                pf.recurrence = {"has_recurrence": True, "date": rec.get("date"), "site": rec.get("site")}
-                if not pf.last_ct_date and rec.get("date"):
-                    pf.last_ct_date = rec["date"]
-            elif isinstance(rec, dict) and rec.get("has_recurrence") is False:
-                pf.recurrence = None
-            if pf.sources is None: pf.sources = []
-            pf.sources.append({"type": f"{kind}_report", "origin": "demo", "name": name})
-            st.session_state.facts_map[pid] = pf
-
-    facts_map_to_df()
-    st.success("Added demo patients via LLM.")
-
 # ===================== LLM QUERY PARSING + FILTERING =====================
 def apply_filters(df: pd.DataFrame, fjson: dict) -> pd.DataFrame:
     out = df.copy()
     f = (fjson or {}).get("filters", {})
 
-    # cancer type
-    if f.get("cancer_type") == "bladder" and "cancer_type" in out.columns:
-        out = out[out["cancer_type"].astype(str).str.contains("bladder", case=False, na=False)]
+    # cancer type substring
+    cstr = (f.get("cancer_type_contains") or "").strip().lower()
+    if cstr and "cancer_type" in out.columns:
+        out = out[out["cancer_type"].astype(str).str.lower().str.contains(cstr, na=False)]
 
     # TNM include (list like ["PT3","PT4"])
     tnm_list = f.get("tnm_include") or []
     if tnm_list and "tnm_stage" in out.columns:
         mask = pd.Series(False, index=out.index)
         for t in tnm_list:
-            rx = r'\b' + re.escape(t) + r'\b'
+            t_norm = str(t).upper()
+            rx = r'\b' + re.escape(t_norm) + r'\b'
             mask = mask | out["tnm_stage"].astype(str).str.upper().str.replace(" ", "", regex=False).str.contains(rx, regex=True, na=False)
         out = out[mask]
 
@@ -351,7 +380,21 @@ def apply_filters(df: pd.DataFrame, fjson: dict) -> pd.DataFrame:
     if f.get("recurrence_required") and "recurrence" in out.columns:
         out = out[out["recurrence"].apply(lambda x: bool(isinstance(x, dict) and x.get("has_recurrence")))]
 
-    # size
+    # metastasis
+    if f.get("metastasis_required") and "metastasis" in out.columns:
+        out = out[out["metastasis"].apply(lambda x: bool(isinstance(x, dict) and x.get("has_metastasis")))]
+
+    # metastasis sites any
+    met_sites_any = f.get("met_sites_any") or []
+    if met_sites_any and "metastasis" in out.columns:
+        want = set([s.lower() for s in met_sites_any])
+        def has_any_sites(m):
+            if not isinstance(m, dict): return False
+            sites = [s.lower() for s in m.get("sites", [])]
+            return bool(want.intersection(sites))
+        out = out[out["metastasis"].apply(has_any_sites)]
+
+    # size threshold
     size_spec = f.get("size_cm")
     if size_spec and "tumor_size_cm" in out.columns:
         op = size_spec.get("op", ">=")
@@ -367,16 +410,27 @@ def apply_filters(df: pd.DataFrame, fjson: dict) -> pd.DataFrame:
             elif op == "<=": out = out[size <= val]
             elif op == "==": out = out[size == val]
 
-    # pretty columns
-    cols = ["patient_id","age","bmi","tnm_stage","tumor_size_cm",
-            "diagnosis_date","surgery_date","last_ct_date","death_date",
-            "cancer_type","recurrence","recurrence_flag","recurrence_date","recurrence_site","sources"]
+    # columns: prioritize key clinical fields
+    cols = ["patient_id","mrn","name","dob",
+            "cancer_type","tnm_stage","tumor_size_cm",
+            "diagnosis_date","surgery_date","last_ct_date",
+            "recurrence_flag","recurrence_date","recurrence_site",
+            "metastasis_flag","metastasis_sites",
+            "nodal_disease","sources"]
+    # ensure the expanded columns exist
+    if "recurrence_flag" not in out.columns and "recurrence" in out.columns:
+        out["recurrence_flag"] = out["recurrence"].apply(lambda x: bool(isinstance(x, dict) and x.get("has_recurrence")))
+        out["recurrence_date"] = out["recurrence"].apply(lambda x: x.get("date") if isinstance(x, dict) else None)
+        out["recurrence_site"] = out["recurrence"].apply(lambda x: x.get("site") if isinstance(x, dict) else None)
+    if "metastasis_flag" not in out.columns and "metastasis" in out.columns:
+        out["metastasis_flag"] = out["metastasis"].apply(lambda x: bool(isinstance(x, dict) and x.get("has_metastasis")))
+        out["metastasis_sites"] = out["metastasis"].apply(lambda x: ", ".join(x.get("sites", [])) if isinstance(x, dict) else None)
     cols = [c for c in cols if c in out.columns]
     return out.loc[:, cols]
 
 # ===================== MAIN QUERY UI =====================
 st.markdown("### 🔎 Ask a question (LLM parsed)")
-q_default = "All bladder cancer patients with stage T3 or T4; include age, TNM, tumor size"
+q_default = "Renal or bladder cancer with metastasis to liver or lung; include TNM and size >= 3 cm"
 question = st.text_input("Natural-language query", value=q_default)
 
 colA, colB = st.columns([1,1])
@@ -387,7 +441,7 @@ with colB:
 
 if run_btn:
     if st.session_state.facts.empty:
-        st.warning("No data yet. Upload PDFs or use the demo button in the sidebar.")
+        st.warning("No data yet. Upload PDFs in the sidebar.")
     else:
         client = get_openai_client()
         if client is None:
@@ -414,8 +468,8 @@ if export_all_btn:
 
 st.markdown("""
 #### Example queries
-- **All bladder cancer patients with stage T3 or T4; include age, TNM, tumor size**
-- **Bladder cancer patients WITH recurrence or progression; show site and last CT date**
-- **Bladder cancer with stage T3 and size >= 3 cm**
-- **Patients WITH recurrence or progression; show site and last CT date** (no bladder filter)
+- **Bladder cancer WITH recurrence; show site**  
+- **Renal cancer with metastasis to liver or lung; include TNM and size >= 3 cm**  
+- **Any cancer with mediastinal lymph node disease**  
+- **Bladder or renal with stage T3 or T4**  
 """)
