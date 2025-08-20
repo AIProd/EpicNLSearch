@@ -13,7 +13,7 @@ from openai import OpenAI
 
 # ===================== CONFIG =====================
 st.set_page_config(page_title="EPIC NL Search — LLM PoC", page_icon="🩺", layout="wide")
-st.title("🩺 EPIC NL Search — LLM-first PoC (aligned to CT / PET-CT / Cytology PDFs)")
+st.title("🩺 EPIC NL Search — LLM-first PoC")
 
 st.markdown("""
 Upload **de-identified, text-based PDFs**. This LLM-first app will:
